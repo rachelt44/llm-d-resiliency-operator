@@ -146,15 +146,19 @@ func (store *memoryJournal) record(t *testing.T) enginefault.Record {
 }
 
 type lwsToday struct {
-	pods     []workload.Pod
-	resetAll int
+	pods      []workload.Pod
+	resetAll  int
+	resetCall int
 }
 
 func (wl *lwsToday) Discover(context.Context) (workload.Group, error) {
 	return workload.Group{Pods: slices.Clone(wl.pods)}, nil
 }
 
-func (*lwsToday) Reset(context.Context, []workload.PodRef) error { return workload.ErrUnsupported }
+func (wl *lwsToday) Reset(context.Context, []workload.PodRef) error {
+	wl.resetCall++
+	return workload.ErrUnsupported
+}
 
 func (wl *lwsToday) ResetAll(context.Context, []workload.PodRef) error {
 	wl.resetAll++
@@ -245,6 +249,43 @@ func TestFlowDeadRankIsRemoved(t *testing.T) {
 	}
 	if payload := run.fleet.ranks[0].applied[0]; params(t, payload)["dp_master_ip"] != nil {
 		t.Fatalf("store moved without reason: %v", payload)
+	}
+}
+
+// TestFlowMemberDiesMatchesCatalog checks the pass criteria from docs/failures/member-dies.md: one
+// reconfig removes the dead rank, survivors are verified before the incident closes, and since vLLM
+// cannot grow, IRO never resets the Pod and the group never resets.
+func TestFlowMemberDiesMatchesCatalog(t *testing.T) {
+	t.Parallel()
+	run := newFlow(t)
+	run.fault(3)
+	record := run.until("shrunk and kept below full", kept("dp3@id3"))
+
+	if len(run.sim.applies) != 3 {
+		t.Fatalf("one reconfig should reach every survivor once, applies %v", run.sim.applies)
+	}
+	id, _, _ := strings.Cut(run.sim.applies[0], ":")
+	for _, apply := range run.sim.applies {
+		if !strings.HasPrefix(apply, id+":scale_down:") {
+			t.Fatalf("applies %v are not all the same reconfig", run.sim.applies)
+		}
+	}
+	if record.Members[engine.MemberID("dp3@id3")] != enginefault.Rejected {
+		t.Fatalf("dp3 should be rejected, members %v", record.Members)
+	}
+	for _, survivor := range []int{0, 1, 2} {
+		if run.fleet.ranks[survivor].prompts != 1 {
+			t.Fatalf("survivor dp%d should be verified exactly once, prompts %d", survivor, run.fleet.ranks[survivor].prompts)
+		}
+	}
+	if run.fleet.ranks[3].prompts != 0 {
+		t.Fatalf("removed dp3 should never be verified, prompts %d", run.fleet.ranks[3].prompts)
+	}
+	if run.wl.resetCall != 0 {
+		t.Fatalf("vLLM cannot grow: IRO must not try to reset the Pod, reset calls %d", run.wl.resetCall)
+	}
+	if run.wl.resetAll != 0 {
+		t.Fatalf("a single dead rank must not reset the whole group, resets %d", run.wl.resetAll)
 	}
 }
 
